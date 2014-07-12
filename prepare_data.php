@@ -1,5 +1,7 @@
 <?php
 
+require_once("QueueResultsAggregator.php");
+
 class LeadTimeCalc {
 
 	private $issues = array();
@@ -14,6 +16,14 @@ class LeadTimeCalc {
 	private $currentEvent;
 	private $runningTime = 0;
 	private $leadTimeRunningPeriod = 2592000; //30 days in seconds
+	private $aggregator; 
+	private $timeToProbability60BeingResolved = 24;
+	private $timeToProbability90BeingResolved = 230;
+	private $lowCapacityAssignees = array();
+
+	function __construct() {
+		$this->aggregator = new QueueResultsAggregator();
+	}
 
 	function printHeader($file = "header.html") {
 		echo file_get_contents($file);
@@ -79,6 +89,10 @@ class LeadTimeCalc {
 
 	function processIssueUpdate($row) {
 		switch ($row['status']) {
+			case 0:
+				# Assignee change
+				$this->issues[$row['issue']]['assigned_user_id'] = $row['assigned_user_id'];
+				break;
 			case 1:
 			case 6:
 			case 7:
@@ -105,21 +119,28 @@ class LeadTimeCalc {
 	function stackEvents() {
 		$link = new mysqli('localhost', 'root', 'password', 'redmine'); 
 
-		$sql    = 
-			"SELECT *, UNIX_TIMESTAMP(timestamp) as timest FROM 
-			(SELECT id AS 'issue', created_on AS 'timestamp', 1 AS 'status' FROM issues 
-				UNION SELECT journalized_id AS 'issue', created_on AS 'timestamp', value AS 'status' 
+		$sqlIssues    = "SELECT id AS 'issue', UNIX_TIMESTAMP(created_on) as timest, 1 AS 'status', NULL as 'assigned_user_id' 
+					FROM issues 
+				    ORDER BY timest DESC";
+		$this->aggregator->registerQueue($link->query($sqlIssues));
+
+		$sqlStatus = "SELECT journalized_id AS 'issue', UNIX_TIMESTAMP(created_on) AS 'timest', value AS 'status', NULL AS 'assigned_user_id' 
 				FROM journals 
 				LEFT JOIN journal_details ON journal_details.journal_id = journals.id 
-				WHERE prop_key = 'status_id'
-				) as unioned 
-				ORDER BY timest ASC";
-		$result = $link->query($sql);	
-		while ($row = $result->fetch_assoc()) {
-			array_push($this->events, $row);
+				WHERE prop_key = 'status_id' ORDER BY created_on DESC";
+		$this->aggregator->registerQueue($link->query($sqlStatus));
+
+		$sqlAssignee = "SELECT journalized_id AS 'issue', UNIX_TIMESTAMP(created_on) AS 'timest', 0 as 'status', value AS 'assigned_user_id'  
+				FROM journals 
+				LEFT JOIN journal_details ON journal_details.journal_id = journals.id 
+				WHERE prop_key = 'assigned_to_id' AND value IS NOT NULL 
+				ORDER BY created_on DESC";
+
+		$this->aggregator->registerQueue($link->query($sqlAssignee));
+
+		while ($event = $this->aggregator->getNextEvent()) {
+			array_push($this->events, $event);
 		}
-		$result->free();
-		$this->events = array_reverse($this->events);
 		$this->currentEvent = array_pop($this->events);
 		$this->recalculateAvgLeadTime();
 	}
@@ -191,11 +212,24 @@ class LeadTimeCalc {
 	}
 
 
+	function calculateOpenAssignee($threshold) {
+		foreach ($this->openIssues as $openIssueId => $issue) {
+			if (!array_key_exists('assigned_user_id', $this->issues[$openIssueId])) continue;
+			if (array_key_exists('treshold', $this->issues[$openIssueId])) continue;
+			if (($this->runningTime-$this->issues[$openIssueId]['timest']) > $threshold) {
+				@$this->lowCapacityAssignees[$this->issues[$openIssueId]['assigned_user_id']]++; 
+				$this->issues[$openIssueId]['treshold'] = true;
+				$userId = $this->issues[$openIssueId]['assigned_user_id'];
+				$total = $this->lowCapacityAssignees[$this->issues[$openIssueId]['assigned_user_id']];
+				// echo "User $userId holded issue $openIssueId with threshold $threshold hours, total holds $total\n";
+			}
+		}
+	} 
+
 	function run() {
 		$this->printHeader();
 		$this->stackEvents();
-
-		for ($this->runningTime = (1332932400-3600); $this->runningTime < time(); $this->runningTime += 3600) {
+		for ($this->runningTime = ($this->currentEvent['timest']-3600); $this->runningTime < time(); $this->runningTime += 3600) {
 			$timeString = date("c", $this->runningTime);
 			while ($this->currentEvent['timest'] <= $this->runningTime && count($this->events) != 0) {
 				$this->processCurrentEvent();
@@ -242,9 +276,25 @@ class LeadTimeCalc {
 		$this->printFooter("footer3.html");
 	}	
 
+	function runOpenAssigneeAnalysis() {
+		$this->stackEvents();
+		for ($this->runningTime = ($this->currentEvent['timest']-3600); $this->runningTime < time(); $this->runningTime += 3600) {
+			$this->calculateOpenAssignee($this->timeToProbability90BeingResolved);
+			$timeString = date("c", $this->runningTime);
+			while ($this->currentEvent['timest'] <= $this->runningTime && count($this->events) != 0) {
+				$this->processCurrentEvent();
+			} 
+		} 
+		foreach ($this->lowCapacityAssignees as $lowCapacityAssigneeId => $nb) {
+			echo "$lowCapacityAssigneeId - holded issues $nb times\n";
+		}
+	}
+
+
 }
 
 $calc = new LeadTimeCalc();
 $calc->run();
 // $calc->runDistributionAnalysis();
 // $calc->runFinalDistributionAnalysis();
+// $calc->runOpenAssigneeAnalysis();
