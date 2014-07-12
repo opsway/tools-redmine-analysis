@@ -1,0 +1,18 @@
+        ]);
+
+      var options = {
+          title: 'LeadTime distribution, %% of tickets',
+          vAxis: {title: 'Date',  titleTextStyle: {color: 'red'}},
+          isStacked: true
+        };
+
+        var chart = new google.visualization.BarChart(document.getElementById('chart_div'));
+        chart.draw(data, options);
+      }
+    </script>
+  </head>
+
+  <body>
+    <div id='chart_div' style='width: 1200px; height: 600px;'></div>
+  </body>
+</html>
